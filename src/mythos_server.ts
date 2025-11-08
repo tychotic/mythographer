@@ -77,11 +77,12 @@ server.keepAliveTimeout = 3600000;
 // ------------------------ WebSocket layer ------------------------
 // Message protocol (client -> server)
 type ClientPrompt = { type: "prompt"; prompt: string };
+type ClientModify = { type: "modify"; prompt: string, originalJson: Island };
 type ClientCancel = { type: "cancel" };
 type ClientPing = { type: "ping" };
-type ClientMessage = ClientPrompt | ClientCancel | ClientPing;
+type ClientMessage = ClientPrompt | ClientModify | ClientCancel | ClientPing;
 
-type stageName = "received" | "translating" | "validating" | "repair" | "idle";
+type stageName = "received" | "translating" | "modifying" | "validating" | "repair" | "idle";
 // Event protocol (server -> client)
 // Here we define what the server can send back to the client
 type EvStatus = {
@@ -92,7 +93,7 @@ type EvStatus = {
 };
 
 // core result will be of type Island, but we use unknown here to keep it flexible
-type EvResult = { event: "result"; data: unknown };
+type EvResult = { event: "result"; data: unknown; is_modify?: boolean };
 
 // a partial result has some non-copmliance with the schema but is likely useful
 type EvResultPartial = { event: "result_partial"; data: unknown; message: string };
@@ -172,7 +173,10 @@ async function runJob(
     }
 
     // Proceed to schema validation & repair
-    await validateAndRepair(ws, state, jobId, translation_result.data);
+    let finalResult = await withTimeout(validateAndRepair(ws, state, jobId, translation_result.data), 180_000);
+    if(finalResult.success === true) {
+      send(ws, { event: "result", data: finalResult.data });
+    }
   } catch (err: any) {
     sendError(ws, err.message);
   } finally {
@@ -182,6 +186,60 @@ async function runJob(
     send(ws, { event: "done", ok: !state.canceled });
   }
 }
+
+
+async function runModificationJob(
+  ws: WebSocket,
+  state: SocketState,
+  jobId: number,
+  prompt: string,
+  previousJson: Island
+): Promise<void> {
+  const isStale = makeStaleChecker(state, jobId);
+
+  try {
+    if (isStale()) return;
+    setBusy(state, true);
+    state.jobName = "modifying";
+
+    sendStatus(ws, state, "received", "Prompt received.");
+    sendStatus(ws, state, "modifying", "Starting modification to schema...");
+    console.info(`[runJob:${jobId}] Starting modification for prompt...`);
+
+    // Main translation step — may take minutes
+    let translation_result: Result<Island>;
+    try {
+      translation_result = await withTimeout(translator.modify(previousJson, prompt), 180_000);
+    } catch (err: any) {
+      throw new Error(`Modification failed: ${err.message}`);
+    }
+
+    // Stop quietly if canceled mid-translation
+    if (isStale()) return;
+
+    // Bail early if the model failed to produce any valid JSON
+    if (!translation_result.success) {
+      sendError(ws, translation_result.message);
+      return;
+    }
+
+    // Proceed to schema validation & repair
+    let finalResult = await(withTimeout(validateAndRepair(ws, state, jobId, translation_result.data), 180_000));
+    if(finalResult.success === true) {
+      send(ws, { event: "result", data: finalResult.data, is_modify: true });
+    }
+  } catch (err: any) {
+    sendError(ws, err.message);
+  } finally {
+    // Always clean up so the system can accept new jobs
+    setBusy(state, false);
+    state.jobName = "idle";
+    send(ws, { event: "done", ok: !state.canceled });
+  }
+}
+
+
+
 
 // =============================================
 // 🔷 Validation + Repair loop
@@ -197,13 +255,13 @@ async function validateAndRepair(
   state: SocketState,
   jobId: number,
   json: Island
-): Promise<void> {
+): Promise<Result<Island>> {
   const isStale = makeStaleChecker(state, jobId);
   let current = json;
   const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (isStale()) return;
+    if (isStale()) return { success: false, message: "Job stale or canceled during validation." };
 
     sendStatus(ws, state, "validating", `Validating schema (attempt ${attempt})`);
 
@@ -212,8 +270,8 @@ async function validateAndRepair(
     // ✅ Schema compliance achieved
     if (validation.success) {
       console.info(`[validate:${jobId}] Schema valid on attempt ${attempt}`);
-      send(ws, { event: "result", data: current });
-      return;
+      console.info(`returning good result: \n ${JSON.stringify(current, null, 2)}`);
+      return { success: true, data: current };
     }
 
     // ❌ Validation failed; handle depending on attempt count
@@ -229,27 +287,29 @@ async function validateAndRepair(
     // Attempt automated repair
     sendStatus(ws, state, "repair", `Repairing (${attempt}/3): ${validation.message}`);
 
+    let repair_result: Result<Island>;
     try {
-      const repair = await withTimeout(translator.repair(current, validation.message), 90_000);
+      repair_result = await (withTimeout (translator.repair(current, validation.message), 180_000));
 
-      if (!repair.success) {
-        // Catastrophic repair failure (no JSON at all)
+      if (!repair_result.success) {
+        // Catastrophic repair failure (no JSON at all) - return last valid json, which has schema errors but is coherent otherwise
         send(ws, {
           event: "result_partial",
           data: current,
-          message: `Repair ${attempt} failed: ${repair.message}`
+          message: `Repair ${attempt} failed: ${repair_result.message}`
         });
         break;
       }
 
       // Store the repaired JSON and loop to re-validate
-      current = repair.data;
+      current = repair_result.data;
       await sleep(500); // small backoff before re-validation
     } catch (err: any) {
       send(ws, { event: "error", message: `Repair ${attempt} threw: ${err.message}` });
       break;
     }
   }
+  return { success: false, message: "Validation and repair loop exited unexpectedly."};
 }
 
 // =============================================
@@ -308,6 +368,7 @@ wss.on("connection", (ws: WebSocket) => {
     let rawStr = raw.toString();
 
     try {
+      console.log("Received message:", rawStr);
       msg = JSON.parse(rawStr) as ClientMessage;
     } catch {
       send(ws, { event: "error", message: "Design Server: Invalid JSON in message from client" });
@@ -323,9 +384,11 @@ wss.on("connection", (ws: WebSocket) => {
       if (state.busy) {
         state.canceled = true;
         // We can't truly abort translate() without upstream support; we just stop emitting any further events
-        send(ws, { event: "status", stage: "idle", message: "Cancellation requested." });
+        // translate, modify, and repair are all awaited with cancellation checks in between steps
+        // you can't cancel mid-translate (at the moment) but you can prevent further processing
+        sendStatus(ws, state, "idle", "Job canceled by client.");
       } else {
-        send(ws, { event: "status", stage: "idle", message: "No active job to cancel." });
+        sendStatus(ws, state, "idle", "No active job to cancel.");
       }
       return;
     }
@@ -348,6 +411,29 @@ wss.on("connection", (ws: WebSocket) => {
       runJob(ws, state, jobId, prompt);
       return;
     }
+
+    if(msg.type === "modify") {
+      const prompt = (msg.prompt ?? "").trim();
+      if (!prompt) {
+        send(ws, { event: "error", message: "Missing 'prompt'." });
+        send(ws, { event: "done", ok: false });
+        return;
+      }
+      if (state.busy) {
+        send(ws, { event: "error", message: "Job already in progress on this connection." });
+        return;
+      }
+      const previousJson = msg.originalJson;
+      if (!previousJson) {
+        send(ws, { event: "error", message: "Missing 'originalJson'." });
+        send(ws, { event: "done", ok: false });
+        return;
+      }
+      // Start a new job id
+      const jobId = ++state.lastJobId;
+      runModificationJob(ws, state, jobId, prompt, previousJson);
+      return;
+    } 
 
     // Fallback for unknown message types
     send(ws, { event: "error", message: "Unknown message type." });
