@@ -1,12 +1,12 @@
 {
 
-  "name": "mythlang",
+  "name": "mythographer",
 
   "version": "1.0.0",
 
-  "description": "design configuration generator",
+  "description": "abstract game design generator",
 
-  "main": "/dist/mythlang_srv.js",
+  "main": "/dist/mythos_server.js",
 
   "scripts": {
 
@@ -14,9 +14,7 @@
 
     "postbuild": "copyfiles -u 1 src/**/*schema.ts src/**/*.txt dist",
 
-    "server": "node ./dist/mythlang_srv.js",
-
-    "sockets": "node ./dist/mythOS_socket_server.js"
+    "server": "node ./dist/mythos_server.js"
 
   },
 
