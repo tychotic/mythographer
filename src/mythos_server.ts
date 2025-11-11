@@ -95,8 +95,8 @@ type EvStatus = {
 // core result will be of type Island, but we use unknown here to keep it flexible
 type EvResult = { event: "result"; data: unknown; is_modify?: boolean };
 
-// a partial result has some non-copmliance with the schema but is likely useful
-type EvResultPartial = { event: "result_partial"; data: unknown; message: string };
+// a partial result has some non-compliance with the schema but is likely useful
+type EvResultPartial = { event: "result_partial"; data: unknown; message: string ; is_modify?: boolean};
 
 type EvError = { event: "error"; message: string };
 type EvDone = { event: "done"; ok: boolean };
@@ -173,7 +173,7 @@ async function runJob(
     }
 
     // Proceed to schema validation & repair
-    let finalResult = await withTimeout(validateAndRepair(ws, state, jobId, translation_result.data), 180_000);
+    let finalResult = await withTimeout(validateAndRepair(ws, state, jobId, translation_result.data, false), 180_000);
     if(finalResult.success === true) {
       send(ws, { event: "result", data: finalResult.data });
     }
@@ -193,7 +193,7 @@ async function runModificationJob(
   state: SocketState,
   jobId: number,
   prompt: string,
-  previousJson: Island
+  previousJson: Island,
 ): Promise<void> {
   const isStale = makeStaleChecker(state, jobId);
 
@@ -224,7 +224,7 @@ async function runModificationJob(
     }
 
     // Proceed to schema validation & repair
-    let finalResult = await(withTimeout(validateAndRepair(ws, state, jobId, translation_result.data), 180_000));
+    let finalResult = await(withTimeout(validateAndRepair(ws, state, jobId, translation_result.data, true), 180_000));
     if(finalResult.success === true) {
       send(ws, { event: "result", data: finalResult.data, is_modify: true });
     }
@@ -254,7 +254,8 @@ async function validateAndRepair(
   ws: WebSocket,
   state: SocketState,
   jobId: number,
-  json: Island
+  json: Island,
+  is_modify: boolean,
 ): Promise<Result<Island>> {
   const isStale = makeStaleChecker(state, jobId);
   let current = json;
@@ -279,7 +280,8 @@ async function validateAndRepair(
       send(ws, {
         event: "result_partial",
         data: current,
-        message: `Max repair attempts reached. Last error: ${validation.message}`
+        message: `Max repair attempts reached. Last error: ${validation.message}`,
+        is_modify: is_modify
       });
       break;
     }
@@ -296,7 +298,8 @@ async function validateAndRepair(
         send(ws, {
           event: "result_partial",
           data: current,
-          message: `Repair ${attempt} failed: ${repair_result.message}`
+          message: `Repair ${attempt} failed: ${repair_result.message}`,
+          is_modify: is_modify
         });
         break;
       }
